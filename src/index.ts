@@ -355,6 +355,193 @@ const _saveFilesSync = async ({
   }
 };
 
+const _saveFilesAsync = async ({
+  filesToDownload,
+  currentCache,
+  webContents,
+  token,
+}: {
+  filesToDownload: RemoteFileType[];
+  token: string;
+  currentCache: {
+    localGithubCache: CacheItemType[];
+    localDiskCache: CacheItemType[];
+  };
+  webContents: Electron.WebContents;
+}) => {
+  const win = BrowserWindow.fromWebContents(webContents);
+
+  win.setTitle(`Загрузка файлов...`);
+
+  if (!filesToDownload.length) {
+    await log({
+      message: `Нет файлов для загрузки`,
+      category: "FILES_REMOTE_DOWNLOAD",
+      status: "SUCCESS",
+      webContents,
+    });
+
+    win.setProgressBar(-1);
+    webContents.send("handle-progress", {
+      progress: 100,
+      status: "SUCCESS",
+    });
+
+    return;
+  }
+
+  let currentProgress = 0;
+  const oneFileProgress = 1.0 / filesToDownload.length;
+
+  win.setProgressBar(0);
+
+  const newCache = {
+    localGithubCache: deepcopy(currentCache.localGithubCache),
+    localDiskCache: deepcopy(currentCache.localDiskCache),
+  };
+
+  await log({
+    message: `Загрузка ${filesToDownload.length} файлов...`,
+    category: "FILES_REMOTE_DOWNLOAD",
+    webContents,
+  });
+
+  try {
+    await Promise.all(
+      (filesToDownload as RemoteFileType[]).map(async (downloadedFile) => {
+        await log({
+          message: `Загрузка файла ${downloadedFile.path}...`,
+          category: "FILES_REMOTE_DOWNLOAD",
+          webContents,
+        });
+
+        const { data } = await getBlob({ sha: downloadedFile.sha, token });
+
+        await log({
+          message: `Загрузка файла ${downloadedFile.path} успешно завершена`,
+          category: "FILES_REMOTE_DOWNLOAD",
+          status: "SUCCESS",
+          webContents,
+        });
+
+        await log({
+          message: `Сохранение файла ${downloadedFile.path}...`,
+          category: "FILES_REMOTE_SAVE",
+          webContents,
+        });
+
+        const {
+          size: savedFileSize,
+          sha: savedFileSha,
+          remotePath: savedFilePath,
+          localPath: savedFileLocalPath,
+        } = await saveFile({
+          filePath: downloadedFile.path,
+          fileBuffer: Buffer.from(data as string, "utf-8"),
+        });
+
+        await log({
+          message: `Сохранение файла ${downloadedFile.path} успешно завершено. Файл сохранен в ${savedFileLocalPath}`,
+          category: "FILES_REMOTE_SAVE",
+          status: "SUCCESS",
+          webContents,
+        });
+
+        const existingCacheIndex = newCache.localGithubCache.findIndex(
+          (cachedFile) => cachedFile.path === downloadedFile.path
+        );
+
+        if (existingCacheIndex !== -1) {
+          // Вносим изменения в кэш
+          newCache.localGithubCache[existingCacheIndex] = {
+            path: downloadedFile.path as string,
+            sha: downloadedFile.sha as string,
+            size: downloadedFile.size as number,
+          };
+          newCache.localDiskCache[existingCacheIndex] = {
+            path: downloadedFile.path as string,
+            sha: savedFileSha,
+            size: savedFileSize,
+          };
+        } else {
+          // Добавляем новый файл в кэш
+          newCache.localGithubCache.push({
+            path: downloadedFile.path as string,
+            sha: downloadedFile.sha as string,
+            size: downloadedFile.size as number,
+          });
+          newCache.localDiskCache.push({
+            path: downloadedFile.path as string,
+            sha: savedFileSha,
+            size: savedFileSize,
+          });
+        }
+
+        currentProgress += oneFileProgress;
+        win.setProgressBar(currentProgress);
+        webContents.send("handle-progress", {
+          progress: currentProgress * 100,
+          status: "IN_PROGRESS",
+        });
+      })
+    );
+
+    win.setProgressBar(-1);
+    webContents.send("handle-progress", {
+      progress: 100,
+      status: "SUCCESS",
+    });
+
+    await log({
+      message: `Загрузка ${filesToDownload.length} файлов успешно завершена`,
+      category: "FILES_REMOTE_DOWNLOAD",
+      status: "SUCCESS",
+      webContents,
+    });
+  } catch (error) {
+    await log({
+      message: `Ошибка при загрузке файлов: ${error}`,
+      category: "FILES_REMOTE_DOWNLOAD",
+      status: "ERROR",
+      webContents,
+    });
+    webContents.send("handle-progress", {
+      progress: 100,
+      status: "ERROR",
+    });
+    win.setProgressBar(1, { mode: "error" });
+    dialog.showErrorBox("Ошибка при загрузке файлов", error.message);
+  } finally {
+    await log({
+      message: `Сохранение кэша...`,
+      category: "CACHE_SAVE",
+      webContents,
+    });
+
+    win.setTitle(`Сохранение кэша...`);
+
+    const isCacheSaved = await saveCache({
+      cache: newCache,
+    });
+
+    if (isCacheSaved && isCacheSaved.path) {
+      await log({
+        message: `Кэш успешно сохранен в ${isCacheSaved.path}`,
+        category: "CACHE_SAVE",
+        status: "SUCCESS",
+        webContents,
+      });
+    } else {
+      await log({
+        message: `Ошибка при сохранении кэша`,
+        category: "CACHE_SAVE",
+        status: "ERROR",
+        webContents,
+      });
+    }
+  }
+};
+
 const handleSync = async (
   event: Electron.IpcMainEvent,
   { branch, token }: { branch: string; token: string }
@@ -388,7 +575,7 @@ const handleSync = async (
     token,
   });
 
-  await _saveFilesSync({
+  await _saveFilesAsync({
     filesToDownload: filesToDownload,
     currentCache,
     webContents,
